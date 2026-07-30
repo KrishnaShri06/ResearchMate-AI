@@ -1,0 +1,191 @@
+"""
+Grok Service Module.
+Handles all interactions with the xAI Grok API for image analysis
+and paper relevance explanations.
+"""
+
+import json
+import base64
+import logging
+from openai import OpenAI
+from utils.config import GROQ_API_KEY, GROQ_BASE_URL, GROQ_VISION_MODEL, GROQ_TEXT_MODEL
+
+logger = logging.getLogger(__name__)
+
+# Initialize the OpenAI client pointed at Groq's API
+client = OpenAI(
+    api_key=GROQ_API_KEY or "dummy_key_if_missing",
+    base_url=GROQ_BASE_URL,
+)
+
+# ── Prompt Templates ────────────────────────────────────────────────
+
+IMAGE_ANALYSIS_PROMPT = """You are a scientific figure analysis expert. Analyze the uploaded scientific figure and provide a comprehensive breakdown in the following JSON format. Be detailed enough for semantic retrieval against research paper abstracts.
+
+Return ONLY valid JSON with no extra text:
+
+{
+  "description": "A detailed description of the scientific figure including its purpose, structure, components, data shown, and key takeaways.",
+  "keywords": ["keyword1", "keyword2", "keyword3", "..."],
+  "domain": "The primary research domain (e.g., Computer Vision, NLP, Bioinformatics, etc.)",
+  "graph_type": "Type of figure (e.g., architecture diagram, bar chart, line graph, flowchart, scatter plot, etc.)",
+  "scientific_concepts": ["concept1", "concept2"],
+  "methodology": "Description of methodology if identifiable from the figure.",
+  "algorithms": ["algorithm1", "algorithm2"],
+  "models": ["model1", "model2"],
+  "experimental_setup": "Description of experimental setup if visible.",
+  "technologies": ["technology1", "technology2"]
+}"""
+
+EXPLANATION_PROMPT_TEMPLATE = """You are a research assistant. Given an image description and a list of recommended research papers, explain WHY each paper is relevant to the image in 1-2 concise sentences. Focus on the specific connection between the paper's content and what was identified in the figure.
+
+Image Description:
+{image_description}
+
+Image Keywords:
+{keywords}
+
+Papers:
+{papers_text}
+
+Return ONLY a valid JSON array of objects with "title" and "reason" keys. Example:
+[
+  {{"title": "Paper Title", "reason": "Recommended because..."}}
+]"""
+
+
+async def analyze_image(image_bytes: bytes, mime_type: str) -> dict:
+    """
+    Send an image to Grok Vision API for scientific figure analysis.
+
+    Args:
+        image_bytes: Raw image bytes.
+        mime_type: MIME type of the image (e.g., 'image/png').
+
+    Returns:
+        A dictionary containing image description, keywords, and domain.
+
+    Raises:
+        Exception: If the Grok API call fails or returns invalid JSON.
+    """
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is not set. Please configure it in the .env file.")
+
+    # Encode image as base64 data URL
+    base64_image = base64.b64encode(image_bytes).decode("utf-8")
+    data_url = f"data:{mime_type};base64,{base64_image}"
+
+    try:
+        logger.info("Sending image to Grok Vision API for analysis...")
+
+        response = client.chat.completions.create(
+            model=GROQ_VISION_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": IMAGE_ANALYSIS_PROMPT,
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": data_url,
+                            },
+                        },
+                    ],
+                }
+            ],
+            temperature=0.3,
+            max_tokens=1500,
+        )
+
+        raw_content = response.choices[0].message.content.strip()
+        logger.info("Grok Vision API response received.")
+
+        # Parse JSON from response — handle markdown code fences
+        if raw_content.startswith("```"):
+            raw_content = raw_content.split("\n", 1)[1]  # Remove first line (```json)
+            raw_content = raw_content.rsplit("```", 1)[0]  # Remove closing ```
+
+        analysis = json.loads(raw_content)
+
+        # Ensure required keys exist with defaults
+        analysis.setdefault("description", "No description generated.")
+        analysis.setdefault("keywords", [])
+        analysis.setdefault("domain", "Unknown")
+
+        return analysis
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse Grok response as JSON: {e}")
+        logger.error(f"Raw response: {raw_content}")
+        raise ValueError(f"Grok returned invalid JSON: {e}")
+    except Exception as e:
+        logger.error(f"Grok Vision API call failed: {e}")
+        raise
+
+
+async def explain_recommendations(image_description: str, keywords: list, papers: list[dict]) -> list[dict]:
+    """
+    Ask Grok to explain why each paper is relevant to the image.
+
+    Args:
+        image_description: The description generated by image analysis.
+        keywords: Keywords extracted from the image.
+        papers: List of paper dicts with 'title' and 'abstract'.
+
+    Returns:
+        A list of dicts with 'title' and 'reason' keys.
+    """
+    if not GROQ_API_KEY:
+        raise ValueError("GROQ_API_KEY is not set. Please configure it in the .env file.")
+
+    # Build papers text block
+    papers_text = ""
+    for i, paper in enumerate(papers, 1):
+        papers_text += f"\n{i}. Title: {paper['title']}\n   Abstract: {paper['abstract']}\n"
+
+    prompt = EXPLANATION_PROMPT_TEMPLATE.format(
+        image_description=image_description,
+        keywords=", ".join(keywords),
+        papers_text=papers_text,
+    )
+
+    try:
+        logger.info("Requesting paper relevance explanations from Grok...")
+
+        response = client.chat.completions.create(
+            model=GROQ_TEXT_MODEL,
+            messages=[
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.4,
+            max_tokens=2000,
+        )
+
+        raw_content = response.choices[0].message.content.strip()
+
+        # Parse JSON from response — handle markdown code fences
+        if raw_content.startswith("```"):
+            raw_content = raw_content.split("\n", 1)[1]
+            raw_content = raw_content.rsplit("```", 1)[0]
+
+        explanations = json.loads(raw_content)
+        logger.info(f"Received explanations for {len(explanations)} papers.")
+        return explanations
+
+    except json.JSONDecodeError as e:
+        logger.error(f"Failed to parse Grok explanation response: {e}")
+        # Fallback: return generic reasons
+        return [
+            {"title": p["title"], "reason": "Relevant based on semantic similarity to the uploaded figure."}
+            for p in papers
+        ]
+    except Exception as e:
+        logger.error(f"Grok explanation API call failed: {e}")
+        return [
+            {"title": p["title"], "reason": "Explanation unavailable due to API error."}
+            for p in papers
+        ]
